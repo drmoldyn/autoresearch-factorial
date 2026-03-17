@@ -225,7 +225,8 @@ def _replace_kv_head_ratio(content: str, value) -> str:
     else:
         # Full MHA: n_kv_head = n_head
         replacement = "n_kv_head=model_dim // HEAD_DIM,"
-    pattern = r'n_kv_head\s*=\s*[^,]+,'
+    # Match n_kv_head= within a single line only (no newline crossing)
+    pattern = r'n_kv_head\s*=\s*[^,\n]+,'
     new_content, count = re.subn(pattern, replacement, content, count=1)
     if count == 0:
         raise ValueError("Could not find n_kv_head= in train.py")

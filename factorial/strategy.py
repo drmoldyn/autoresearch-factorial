@@ -22,10 +22,13 @@ from .factors import (
     EPOCH_0_FACTORS,
     ROTATION_FACTORS,
     Factor,
+    compute_calibration_range,
     find_factor,
     get_factor_rotation,
     get_muon_subfactors,
     get_rotation_candidates,
+    is_categorical,
+    make_calibrated_factor,
 )
 
 if TYPE_CHECKING:
@@ -56,8 +59,10 @@ class GenerationStrategy:
 
         # Accumulated within-epoch results (list per generation)
         self._gen_results: list[dict] = []
-        # Factors locked during this epoch (mid-epoch locks)
+        # Factors locked during this epoch (mid-epoch locks — categoricals only)
         self._mid_epoch_locks: dict[str, float] = {}
+        # Factors calibrated during this epoch (continuous factors with refined ranges)
+        self._mid_epoch_calibrations: dict[str, dict] = {}
         # Current factor set (evolves each generation)
         self._current_factors: list[Factor] | None = None
 
@@ -94,8 +99,29 @@ class GenerationStrategy:
                 if g_summary.get("generation") == gen:
                     winner = g_summary.get("winner_config", {})
                     self.record_generation_result(gen, g_summary, winner)
-                    # Also replay any mid-epoch locks that would have happened
-                    self._check_mid_epoch_locks()
+
+                    # Reconstruct _current_factors from the replayed gen's
+                    # factors_tested list so _evolve_factors() can work.
+                    tested_names = g_summary.get("factors_tested", [])
+                    if tested_names:
+                        reconstructed = []
+                        for name in tested_names:
+                            # Check calibrating first
+                            cal = knowledge.get_calibrating_factors().get(name)
+                            if cal:
+                                f = make_calibrated_factor(name, cal)
+                                if f:
+                                    reconstructed.append(f)
+                                    continue
+                            # Fall back to standard factor
+                            f = find_factor(name)
+                            if f:
+                                reconstructed.append(f)
+                        if reconstructed:
+                            self._current_factors = reconstructed
+
+                    # Replay any mid-epoch promotions (locks + calibrations)
+                    self._check_mid_epoch_promotions()
                     return
         # If no matching generation found, create a minimal placeholder
         # so gen numbering stays correct
@@ -107,6 +133,10 @@ class GenerationStrategy:
     def get_mid_epoch_locks(self) -> dict[str, float]:
         """Return all factors locked during this epoch (for baseline update)."""
         return dict(self._mid_epoch_locks)
+
+    def get_mid_epoch_calibrations(self) -> dict[str, dict]:
+        """Return all factors calibrated during this epoch."""
+        return dict(self._mid_epoch_calibrations)
 
     # ------------------------------------------------------------------
     # Gen 0: use epoch's starting factor set
@@ -157,10 +187,13 @@ class GenerationStrategy:
                 name, effect, t_ratio, sig = entry[0], entry[1], entry[2], entry[3]
                 factor_stats[name] = (t_ratio, sig, effect)
 
-        # ------- 1. LOCK -------
-        new_locks = self._check_mid_epoch_locks()
+        # ------- 1. LOCK categoricals / CALIBRATE continuous -------
+        new_locks, new_cals = self._check_mid_epoch_promotions()
         for name in new_locks:
             self.log(f"  MID-EPOCH LOCK: {name} = {new_locks[name]}")
+        for name, cal in new_cals.items():
+            self.log(f"  MID-EPOCH CALIBRATE: {name} = {cal['best_value']} "
+                     f"[{cal['range_low']:.4f}, {cal['range_high']:.4f}]")
 
         # ------- 2. Classify current factors -------
         keep = []       # Significant or marginal — keep testing
@@ -202,11 +235,25 @@ class GenerationStrategy:
                 self.log(f"  MUON EXPAND: adding {[f.name for f in expansion]}")
 
         # ------- 4. REFINE ranges for significant survivors -------
+        # Calibrating factors use directed search; others use simple refine
         refined = []
         for f in keep:
             stats = factor_stats.get(f.name)
-            if stats and stats[1] and f.dtype != "categorical":
-                # Significant — refine around winner value
+            if self.knowledge.is_calibrating(f.name) and stats:
+                # Calibrating factor: use directed search range update
+                _, _, effect = stats
+                wval = winner.get(f.name, f.baseline)
+                cal_low, cal_high = compute_calibration_range(
+                    wval, effect, f.low, f.high, f.name,
+                )
+                self.knowledge.calibrate_factor(f.name, wval, cal_low, cal_high)
+                refined.append(Factor(
+                    name=f.name, low=cal_low, high=cal_high,
+                    baseline=wval, dtype=f.dtype,
+                    apply_mode=f.apply_mode, depends_on=f.depends_on,
+                ))
+            elif stats and stats[1] and f.dtype != "categorical":
+                # Significant non-calibrating — refine around winner value
                 wval = winner.get(f.name)
                 if wval is not None:
                     refined.append(f.refine_around(wval))
@@ -237,23 +284,29 @@ class GenerationStrategy:
     # Lock decision logic
     # ------------------------------------------------------------------
 
-    def _check_mid_epoch_locks(self) -> dict[str, float]:
+    def _check_mid_epoch_promotions(self) -> tuple[dict[str, float], dict[str, dict]]:
         """
-        Check if any factors should be locked based on cumulative evidence.
+        Check if any factors should be promoted based on cumulative evidence.
 
-        A factor qualifies for mid-epoch lock when:
+        Categorical factors → LOCK (removed from design).
+        Continuous factors → CALIBRATE (stay in design with refined range).
+
+        A factor qualifies when:
         - Significant in ≥2 cumulative tests (this epoch + historical)
         - Effect direction is consistent in SIGNIFICANT tests (≥75% same sign)
-        - Insignificant runs produce random noise and are excluded from
-          the direction check to prevent false negatives.
+
+        Returns:
+            (new_locks, new_calibrations) where:
+            - new_locks: {name: value} for categorical factors
+            - new_calibrations: {name: {best_value, range_low, range_high}}
         """
         if not self._gen_results:
-            return {}
+            return {}, {}
 
         pi = self.knowledge.get_active_fraction()
         lock_t = adaptive_locking_threshold(pi)
 
-        # Count significance and collect significant-only effects
+        # Count significance and collect significant-only effects per factor
         epoch_sig_count: dict[str, int] = {}
         epoch_sig_effects: dict[str, list[float]] = {}
         for r in self._gen_results:
@@ -264,30 +317,30 @@ class GenerationStrategy:
                     epoch_sig_effects[name] = []
                 epoch_sig_effects[name].append(eff)
 
-        # Combine with historical knowledge
         new_locks = {}
+        new_calibrations = {}
         latest_winner = self._gen_results[-1]["winner"]
 
         for name, epoch_count in epoch_sig_count.items():
             if name in self.locked or name in self._mid_epoch_locks:
                 continue
+            if name in self._mid_epoch_calibrations:
+                continue  # Already calibrating — range update happens in _evolve
 
-            # Historical significance from knowledge store
+            # Use knowledge store's factor_history as the single source of truth.
+            # factor_history is already updated via knowledge.record_generation()
+            # after each gen, so it includes current epoch's results.
+            # Using epoch_count + hist_sig would DOUBLE-COUNT this epoch.
             hist = self.knowledge.data.get("factor_history", {}).get(name, {})
-            hist_sig = hist.get("significant_count", 0)
-            hist_sig_effects = hist.get("significant_effect_sizes", [])
-            # Fallback: if no significant_effect_sizes tracked, use all effects
-            if not hist_sig_effects:
-                hist_sig_effects = hist.get("effect_sizes", [])
-
-            total_sig = epoch_count + hist_sig
+            total_sig = hist.get("significant_count", 0)
             if total_sig < 2:
                 continue  # Need ≥2 significant tests
 
-            # Direction consistency: ≥75% of SIGNIFICANT effects same sign
-            # Only check effects from significant tests — insignificant runs
-            # produce near-zero effects with random sign that poison the check
-            sig_effects = hist_sig_effects + epoch_sig_effects.get(name, [])
+            # Direction consistency check (≥75% of significant effects same sign)
+            hist_sig_effects = hist.get("significant_effect_sizes", [])
+            if not hist_sig_effects:
+                hist_sig_effects = hist.get("effect_sizes", [])
+            sig_effects = list(hist_sig_effects)  # Already includes epoch effects
             nonzero = [e for e in sig_effects if e != 0]
             if not nonzero:
                 continue
@@ -295,17 +348,42 @@ class GenerationStrategy:
             n_neg = len(nonzero) - n_pos
             dominant_count = max(n_pos, n_neg)
             if dominant_count / len(nonzero) < 0.75:
-                continue  # Direction too inconsistent — don't lock
+                continue  # Direction too inconsistent
 
-            # Get the best value to lock at
-            lock_val = latest_winner.get(name)
-            if lock_val is not None:
-                new_locks[name] = lock_val
-                self._mid_epoch_locks[name] = lock_val
+            best_val = latest_winner.get(name)
+            if best_val is None:
+                continue
+
+            if is_categorical(name):
+                # Categorical → LOCK
+                new_locks[name] = best_val
+                self._mid_epoch_locks[name] = best_val
                 self.locked.add(name)
-                self.knowledge.lock_factors({name: lock_val})
+                self.knowledge.lock_factors({name: best_val})
+            else:
+                # Continuous → CALIBRATE with directed range
+                latest_effect = epoch_sig_effects.get(name, [0])[-1]
+                # Find tested range from current factors
+                tested_low, tested_high = best_val, best_val
+                if self._current_factors:
+                    for f in self._current_factors:
+                        if f.name == name:
+                            tested_low = f.low
+                            tested_high = f.high
+                            break
+                cal_low, cal_high = compute_calibration_range(
+                    best_val, latest_effect, tested_low, tested_high, name,
+                )
+                cal_data = {
+                    "best_value": best_val,
+                    "range_low": cal_low,
+                    "range_high": cal_high,
+                }
+                new_calibrations[name] = cal_data
+                self._mid_epoch_calibrations[name] = cal_data
+                self.knowledge.calibrate_factor(name, best_val, cal_low, cal_high)
 
-        return new_locks
+        return new_locks, new_calibrations
 
     def _was_ever_significant(self, name: str) -> bool:
         """Check if a factor was significant in any generation this epoch."""

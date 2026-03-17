@@ -49,6 +49,8 @@ from .factors import (
     check_constraints,
     check_dependencies,
     clear_muon_dependent_locks,
+    compute_calibration_range,
+    find_factor,
     fix_config,
     get_factor_rotation,
 )
@@ -57,7 +59,7 @@ from .strategy import GenerationStrategy
 
 PROJECT_ROOT = Path(__file__).parent.parent
 CONVERGENCE_HOURS = 4.0
-RUN_TIMEOUT = 900  # 15 min max per experiment
+RUN_TIMEOUT = 1800  # 30 min max per experiment (5-min budget + JIT + 4-way contention)
 
 
 class ArmWorker:
@@ -229,6 +231,10 @@ class ArmWorker:
 
         self.log(f"  Pool: {n} experiments across {n_slots} slots")
 
+        # Directory for per-slot stdout/stderr files (avoids pipe deadlock)
+        slot_logs = self.results_dir / "slot_logs"
+        slot_logs.mkdir(parents=True, exist_ok=True)
+
         def _launch(slot_id: int, config_idx: int):
             """Prepare slot file, apply config, launch subprocess."""
             config = configs[config_idx]
@@ -242,18 +248,30 @@ class ArmWorker:
             changes = apply_config(fixed_config, slot_path)
             config_summary = "; ".join(changes[:5])
 
+            # Redirect stdout/stderr to files to avoid pipe buffer deadlock.
+            # Python's print() blocks when the pipe buffer fills (~64KB on macOS).
+            # With long-running train processes, this causes the process to hang.
+            stdout_file = open(slot_logs / f"{label}_stdout.txt", "w")
+            stderr_file = open(slot_logs / f"{label}_stderr.txt", "w")
+
             proc = subprocess.Popen(
                 ["uv", "run", str(slot_path)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                stdout=stdout_file, stderr=stderr_file,
                 cwd=str(self.workspace),
                 env={**os.environ, "PYTHONPATH": str(self.workspace)},
             )
-            active[slot_id] = (proc, config_idx, label, config_summary, slot_path, time.monotonic())
+            active[slot_id] = (proc, config_idx, label, config_summary, slot_path,
+                               time.monotonic(), stdout_file, stderr_file)
 
         def _collect(slot_id: int):
             """Collect result from a finished process in this slot."""
-            proc, config_idx, label, config_summary, slot_path, _launch_t = active[slot_id]
-            val_bpb, peak_vram, status = self._collect_experiment(proc, label)
+            proc, config_idx, label, config_summary, slot_path, _launch_t, stdout_f, stderr_f = active[slot_id]
+            # Close file handles first so output is flushed
+            stdout_f.close()
+            stderr_f.close()
+            val_bpb, peak_vram, status = self._collect_experiment_from_files(
+                proc, label, slot_logs / f"{label}_stdout.txt", slot_logs / f"{label}_stderr.txt",
+            )
 
             with open(self.results_tsv, "a", newline="") as f:
                 writer = csv.writer(f, delimiter="\t")
@@ -281,7 +299,8 @@ class ArmWorker:
         while active:
             now = time.monotonic()
             finished_slots = []
-            for slot_id, (proc, config_idx, label, cfg_sum, slot_path, launch_t) in list(active.items()):
+            for slot_id, slot_data in list(active.items()):
+                proc, config_idx, label, cfg_sum, slot_path, launch_t, stdout_f, stderr_f = slot_data
                 if proc.poll() is not None:
                     finished_slots.append(slot_id)
                 elif now - launch_t > RUN_TIMEOUT:
@@ -343,6 +362,66 @@ class ArmWorker:
             status = f"error:{e}"
             self.log(f"  [{label}] ERROR: {e}")
             self._recent_stderr.append(str(e))
+
+        return val_bpb, peak_vram, status
+
+    def _collect_experiment_from_files(
+        self, proc: subprocess.Popen, label: str,
+        stdout_path: Path, stderr_path: Path,
+    ) -> tuple[float, float, str]:
+        """Collect result from a finished experiment using file-based output.
+
+        Unlike _collect_experiment() which uses proc.communicate() on pipes,
+        this reads stdout/stderr from files — avoiding pipe buffer deadlocks
+        that occur when train.py output exceeds the ~64KB macOS pipe buffer.
+        """
+        try:
+            # Process should already be finished (polled or killed), but ensure
+            proc.wait(timeout=10)
+
+            stdout = stdout_path.read_text() if stdout_path.exists() else ""
+            stderr = stderr_path.read_text() if stderr_path.exists() else ""
+
+            val_bpb = self._parse_val_bpb(stdout)
+            peak_vram = self._parse_peak_vram(stdout)
+            status = "ok"
+
+            if val_bpb is None or (val_bpb is not None and not (val_bpb == val_bpb)):
+                was_nan = val_bpb is not None
+                val_bpb = float("inf")
+                status = "nan" if was_nan else "crash"
+                self.log(f"  [{label}] {'NAN' if was_nan else 'CRASH'}")
+                if not was_nan:
+                    stderr_tail = stderr[-500:] if stderr else ""
+                    self.log(f"  [{label}] stderr: {stderr_tail[-300:]}")
+                    self._recent_stderr.append(stderr_tail)
+            else:
+                self.log(f"  [{label}] val_bpb: {val_bpb:.6f} | vram: {peak_vram:.0f}MB")
+
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            val_bpb = float("inf")
+            peak_vram = 0
+            status = "timeout"
+            self.log(f"  [{label}] TIMEOUT (wait)")
+            stderr = stderr_path.read_text() if stderr_path.exists() else ""
+            self._recent_stderr.append(stderr[-500:] if stderr else "")
+
+        except Exception as e:
+            val_bpb = float("inf")
+            peak_vram = 0
+            status = f"error:{e}"
+            self.log(f"  [{label}] ERROR: {e}")
+            self._recent_stderr.append(str(e))
+
+        finally:
+            # Clean up log files (they're per-experiment, not needed after collection)
+            try:
+                stdout_path.unlink(missing_ok=True)
+                stderr_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
         return val_bpb, peak_vram, status
 
@@ -575,7 +654,8 @@ Then on the LAST LINE, output exactly one of these three words:
 
     def run_epoch(self):
         """Run K generations with adaptive factor evolution, then epoch reset."""
-        self.generation = 0
+        # self.generation comes from checkpoint (>0 if resuming mid-epoch)
+        start_gen = self.generation
         locked = self.knowledge.get_locked_factors()
 
         # Clear Muon-dependent locks if USE_MUON state changed
@@ -599,16 +679,22 @@ Then on the LAST LINE, output exactly one of these three words:
         )
         self.llm_proposed_factors = None  # Consumed by strategy
 
+        calibrating = self.knowledge.get_calibrating_factors()
         self.log(f"\n{'='*60}")
         self.log(f"EPOCH {self.epoch} START (K={self.arm_k}, adaptive strategy)")
         self.log(f"Locked factors: {list(locked.keys())}")
+        if calibrating:
+            self.log(f"Calibrating factors: {list(calibrating.keys())}")
         self.log(f"{'='*60}")
 
         for g in range(self.arm_k):
             # Skip already-completed generations (resume after crash)
-            if g < self.generation:
+            if g < start_gen:
                 strategy.replay_completed_gen(g, self.knowledge)
                 continue
+
+            # Set generation for correct logging/labeling
+            self.generation = g
 
             # Get factors for this generation (evolved from prior gen's results)
             factors = strategy.select_factors_for_gen(g)
@@ -626,6 +712,11 @@ Then on the LAST LINE, output exactly one of these three words:
             if mid_locks:
                 self.current_baseline.update(mid_locks)
 
+            # Apply calibration best values to baseline
+            mid_cals = strategy.get_mid_epoch_calibrations()
+            for name, cal_data in mid_cals.items():
+                self.current_baseline[name] = cal_data["best_value"]
+
         # FACTOR RESET -- epoch boundary
         # Update baseline with locked factor values (high confidence) only.
         # Do NOT blindly adopt epoch_best["config"] — that's a PB run with
@@ -636,10 +727,15 @@ Then on the LAST LINE, output exactly one of these three words:
         for name, value in locked_factors.items():
             self.current_baseline[name] = value
 
-        # Epoch-boundary locking (in addition to mid-epoch locks)
+        # Also apply calibrating factor best values to baseline
+        for name, cal_data in self.knowledge.get_calibrating_factors().items():
+            self.current_baseline[name] = cal_data["best_value"]
+
+        # Epoch-boundary locking: CATEGORICAL factors only
         pi = self.knowledge.get_active_fraction()
         lock_t = adaptive_locking_threshold(pi)
-        self.log(f"  Locking threshold: π={pi:.2f} → t_lock={lock_t:.2f}")
+        self.log(f"  Promotion thresholds: π={pi:.2f} → t_lock={lock_t:.2f}")
+
         lock_candidates = self.knowledge.suggest_lock_candidates(locking_threshold=lock_t)
         if lock_candidates:
             to_lock = {}
@@ -647,12 +743,31 @@ Then on the LAST LINE, output exactly one of these three words:
                 best_val = self.current_baseline.get(name)
                 if best_val is not None:
                     to_lock[name] = best_val
-                    self.log(f"  LOCKING {name} = {best_val} (avg effect: {effect:.6f})")
+                    self.log(f"  LOCKING (categorical): {name} = {best_val} "
+                             f"(avg effect: {effect:.6f})")
             self.knowledge.lock_factors(to_lock)
 
-        # Graduate stale factors: high-confidence but direction-inconsistent
-        # factors that have been tested extensively without ever being locked.
-        # Lock them at baseline to free design slots for new factors.
+        # Epoch-boundary calibration: CONTINUOUS factors with proven significance
+        cal_candidates = self.knowledge.suggest_calibration_candidates()
+        if cal_candidates:
+            for name, effect in cal_candidates[:7]:  # Max 7 calibrations per epoch
+                best_val = self.current_baseline.get(name)
+                if best_val is None:
+                    continue
+                f_orig = find_factor(name)
+                if f_orig is None:
+                    continue
+                cal_low, cal_high = compute_calibration_range(
+                    best_val, effect, f_orig.low, f_orig.high, name,
+                )
+                self.knowledge.calibrate_factor(name, best_val, cal_low, cal_high)
+                self.current_baseline[name] = best_val
+                self.log(f"  CALIBRATING (continuous): {name} = {best_val} "
+                         f"[{cal_low:.4f}, {cal_high:.4f}] "
+                         f"(avg effect: {effect:.6f})")
+
+        # Graduate stale factors: tested extensively but can't pass consistency
+        # Categoricals → locked, Continuous → calibrating
         graduated = self.knowledge.graduate_stale_factors(
             self.current_baseline, min_tests=10, min_sig=5,
             log_fn=self.log,
@@ -677,20 +792,27 @@ Then on the LAST LINE, output exactly one of these three words:
                 self.log(f"  LLM proposal failed ({e}), using rotation")
 
         self.epoch += 1
+        self.generation = 0  # Reset for next epoch
         self.save_checkpoint()
 
+        cal_summary = self.knowledge.get_calibrating_factors()
         self.log(f"\nEPOCH {self.epoch - 1} COMPLETE")
         self.log(f"  Best val_bpb this epoch: {epoch_best['val_bpb']:.6f}")
         self.log(f"  Global best: {self.knowledge.get_best_val_bpb():.6f}")
         self.log(f"  Total experiments: {self.total_experiments}")
-        self.log(f"  Mid-epoch locks applied: {list(strategy.get_mid_epoch_locks().keys())}")
+        self.log(f"  Mid-epoch locks: {list(strategy.get_mid_epoch_locks().keys())}")
+        self.log(f"  Mid-epoch calibrations: {list(strategy.get_mid_epoch_calibrations().keys())}")
+        self.log(f"  Total locked: {list(self.knowledge.get_locked_factors().keys())}")
+        self.log(f"  Total calibrating: {list(cal_summary.keys())}")
 
         # --- Epoch-level retrospective metrics ---
         completed_epoch = self.epoch - 1
         epoch_metrics = {
             "epoch": completed_epoch,
             "total_locked_factors": list(self.knowledge.get_locked_factors().keys()),
+            "total_calibrating_factors": list(cal_summary.keys()),
             "mid_epoch_locks": list(strategy.get_mid_epoch_locks().keys()),
+            "mid_epoch_calibrations": list(strategy.get_mid_epoch_calibrations().keys()),
             "epoch_best_pb_val_bpb": epoch_best.get("val_bpb"),
             "current_baseline": dict(self.current_baseline),
         }

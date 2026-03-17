@@ -115,6 +115,10 @@ ROTATION_FACTORS = [
     Factor("RESID_LR_RATIO", low=0.001, high=0.1, baseline=0.01),
     # Multiplier on SCALAR_LR for resid_lambdas
 
+    # Formerly locked continuous — now unlocked for calibration
+    Factor("LOGIT_CAP", low=15, high=45, baseline=30),
+    Factor("EMBED_WD", low=0.0, high=0.005, baseline=0.0),
+
     # Lower-priority (mostly insignificant in v1, but re-test at new baseline)
     Factor("ROPE_BASE", low=10000, high=200000, baseline=10000),
     Factor("VE_WD", low=0.0, high=0.003, baseline=0.0),
@@ -159,12 +163,16 @@ def _valid_model_dim(cfg: dict) -> bool:
 
 
 def _valid_model_dim_upper_bound(cfg: dict) -> bool:
-    """Model dim must not exceed 256 (larger causes NaN in 5-min budget)."""
+    """Model dim must not exceed 512 (larger causes NaN/OOM in 5-min budget).
+
+    With DEPTH locked at 4, model_dim=256 is baseline (HEAD_DIM=128).
+    Allow up to 512 so HEAD_DIM calibration can explore [64, 256].
+    """
     depth = int(cfg.get("DEPTH", 4))
     aspect = int(cfg.get("ASPECT_RATIO", 64))
     head_dim = int(cfg.get("HEAD_DIM", 128))
     model_dim = ((depth * aspect + head_dim - 1) // head_dim) * head_dim
-    return model_dim <= 256
+    return model_dim <= 512
 
 
 def _valid_mlp_hidden_even(cfg: dict) -> bool:
@@ -178,8 +186,14 @@ def _valid_mlp_hidden_even(cfg: dict) -> bool:
     return hidden % 2 == 0
 
 
+def _valid_head_dim_even(cfg: dict) -> bool:
+    """HEAD_DIM must be even (RoPE positional encoding requires even dims)."""
+    head_dim = int(cfg.get("HEAD_DIM", 128))
+    return head_dim % 2 == 0
+
+
 CONSTRAINTS = [_valid_grad_accum, _valid_model_dim, _valid_model_dim_upper_bound,
-               _valid_mlp_hidden_even]
+               _valid_mlp_hidden_even, _valid_head_dim_even]
 
 
 def check_constraints(cfg: dict) -> list[str]:
@@ -296,20 +310,40 @@ def get_factor_rotation(
     """
     Get factors for a given epoch, using knowledge-driven selection when available.
 
-    Epoch 0: use EPOCH_0_FACTORS.
-    Epoch 1+: prioritize untested rotation factors, then re-screen medium-confidence
-    factors at refined ranges, filling remaining slots with unlocked epoch-0 factors.
+    Priority order:
+    0. CALIBRATING factors (always included — refined range from directed search)
+    1. Untested rotation factors
+    2. Medium-confidence factors (re-screen at refined ranges)
+    3. Low-confidence rotation factors
+    4. Fill with unlocked epoch-0 factors
 
-    If knowledge_store is provided, uses factor history to:
-    - Prioritize untested factors
-    - Re-screen medium-confidence factors at narrower ranges
-    - Skip factors that have been consistently insignificant
+    Calibrating factors get priority because they're proven-significant
+    continuous factors undergoing directed range refinement. They must stay
+    in the design to detect interaction effects and continue converging.
     """
-    if epoch == 0:
-        return [f for f in EPOCH_0_FACTORS if f.name not in locked_factors]
-
     available = []
     used_names = set()
+
+    # 0. Calibrating factors (always included, with knowledge-driven ranges)
+    if knowledge_store:
+        cal_factors = knowledge_store.get_calibrating_factors()
+        for name, cal_data in cal_factors.items():
+            if name in locked_factors or name in used_names:
+                continue
+            cf = make_calibrated_factor(name, cal_data)
+            if cf is not None:
+                available.append(cf)
+                used_names.add(name)
+
+    if epoch == 0:
+        # Epoch 0: calibrating factors + epoch-0 factors
+        for f in EPOCH_0_FACTORS:
+            if f.name not in locked_factors and f.name not in used_names:
+                available.append(f)
+                used_names.add(f.name)
+        return available[:19]
+
+    # Epoch 1+: calibrating + rotation priority
 
     # 1. Untested rotation factors (highest priority for new epochs)
     for f in ROTATION_FACTORS:
@@ -319,8 +353,7 @@ def get_factor_rotation(
         if f.depends_on:
             parent, req = f.depends_on
             if parent in locked_factors:
-                # Check if parent is locked at a different level than required
-                # We can't know the value here, so include and let fix_config handle it
+                # Can't know the value here, include and let fix_config handle it
                 pass
         is_untested = True
         if knowledge_store:
@@ -341,7 +374,6 @@ def get_factor_rotation(
                 # Refine range around best known value
                 latest_effect = knowledge_store.get_latest_effect(f.name)
                 if latest_effect is not None and latest_effect < 0 and f.dtype != "categorical":
-                    # Effect was negative (high level better) — refine around high
                     refined = f.refine_around(f.high)
                 elif latest_effect is not None and latest_effect > 0 and f.dtype != "categorical":
                     refined = f.refine_around(f.low)
@@ -356,8 +388,8 @@ def get_factor_rotation(
             continue
         if knowledge_store:
             confidence = knowledge_store.get_factor_confidence(f.name)
-            if confidence in ("high", "locked"):
-                continue  # Don't re-test high-confidence factors endlessly
+            if confidence in ("high", "locked", "calibrating"):
+                continue  # Calibrating already included above
         available.append(f)
         used_names.add(f.name)
 
@@ -367,13 +399,55 @@ def get_factor_rotation(
             continue
         if knowledge_store:
             confidence = knowledge_store.get_factor_confidence(f.name)
-            if confidence in ("high", "locked"):
+            if confidence in ("high", "locked", "calibrating"):
                 continue
         available.append(f)
         used_names.add(f.name)
 
     # Limit to 19 factors (20-run PB design)
     return available[:19]
+
+
+# ---------------------------------------------------------------------------
+# Hard physical limits for calibration-mode directed search.
+# Initial factor.low/high are the *starting* search region; calibration
+# can explore beyond these up to FACTOR_BOUNDS (true physical limits).
+# Factors not listed here use their initial low/high as hard bounds.
+# ---------------------------------------------------------------------------
+
+FACTOR_BOUNDS = {
+    # Optimizer
+    "ADAM_BETA1": (0.5, 0.999),
+    "ADAM_BETA2": (0.5, 0.999),
+    "EMBEDDING_LR": (0.01, 2.0),
+    "WEIGHT_DECAY": (0.0, 1.0),
+    "MATRIX_LR": (0.001, 0.5),
+    "SCALAR_LR": (0.01, 2.0),
+    "UNEMBEDDING_LR": (0.0001, 0.05),
+    "RESID_LR_RATIO": (0.0001, 1.0),
+    # Schedule
+    "WARMDOWN_RATIO": (0.0, 1.0),
+    "WARMUP_RATIO": (0.0, 0.3),
+    "FINAL_LR_FRAC": (0.0, 0.5),
+    "X0_LAMBDA_INIT": (0.001, 1.0),
+    # Architecture
+    "TOTAL_BATCH_SIZE_EXP": (14, 18),  # min 14 = 2^14 = 16384 (DEVICE_BS=8 * seq=2048)
+    "MLP_EXPANSION": (1.0, 8.0),
+    "HEAD_DIM": (32, 256),
+    "VE_GATE_CHANNELS": (4, 128),
+    "SHORT_WINDOW_FRAC": (0.03125, 1.0),
+    "LOGIT_CAP": (5, 100),
+    "INIT_SCALE": (0.1, 10.0),
+    # Muon
+    "MUON_MOMENTUM": (0.5, 0.999),
+    "MUON_BETA2": (0.5, 0.999),
+    "NS_STEPS": (1, 15),
+    # Regularization
+    "LM_HEAD_WD": (0.0, 0.1),
+    "ROPE_BASE": (1000, 1000000),
+    "VE_WD": (0.0, 0.01),
+    "EMBED_WD": (0.0, 0.01),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +460,152 @@ ALL_FACTORS = {f.name: f for f in EPOCH_0_FACTORS + ROTATION_FACTORS}
 def find_factor(name: str) -> Factor | None:
     """Look up a factor by name from either EPOCH_0 or ROTATION sets."""
     return ALL_FACTORS.get(name)
+
+
+def get_factor_bounds(name: str) -> tuple[float, float]:
+    """Get hard physical limits for a factor (for calibration search).
+    Falls back to the original factor definition if not in FACTOR_BOUNDS."""
+    if name in FACTOR_BOUNDS:
+        return FACTOR_BOUNDS[name]
+    f = ALL_FACTORS.get(name)
+    if f:
+        return (f.low, f.high)
+    return (float("-inf"), float("inf"))
+
+
+def is_categorical(factor_or_name) -> bool:
+    """Check if a factor is categorical/binary (should be locked, not calibrated).
+
+    Binary and categorical factors have discrete levels that can't be refined
+    through range narrowing. They should be fully locked when proven significant.
+    Continuous and integer factors should be calibrated (range narrowing) instead.
+    """
+    if isinstance(factor_or_name, Factor):
+        return factor_or_name.dtype == "categorical"
+    # String name lookup
+    f = ALL_FACTORS.get(factor_or_name)
+    if f:
+        return f.dtype == "categorical"
+    # Known categoricals that may not be in ALL_FACTORS (e.g. locked)
+    return factor_or_name in (
+        "USE_MUON", "ACTIVATION", "WINDOW_PATTERN",
+        "KV_HEAD_RATIO", "CAUTIOUS_WD",
+    )
+
+
+def compute_calibration_range(
+    best_value: float,
+    effect: float,
+    tested_low: float,
+    tested_high: float,
+    name: str,
+) -> tuple[float, float]:
+    """
+    Compute next calibration range using directed search.
+
+    Shifts the test range toward the direction of improvement:
+    - Positive effect (low level better): explore below best_value
+    - Negative effect (high level better): explore above best_value
+    - Near-zero effect: narrow around best_value
+
+    The best_value stays within the new range. Range is clamped to
+    FACTOR_BOUNDS (hard physical limits), which are wider than the
+    initial Factor.low/high search region.
+
+    Example trace (ADAM_BETA2):
+        tested [0.85, 0.99], low better → best=0.85
+        → new range [0.745, 0.885]  (shifted down, best in upper portion)
+        tested [0.745, 0.885], high better → best=0.885
+        → new range [0.85, 0.99]  (shifted up, converging on ~0.85-0.9)
+    """
+    original_low, original_high = get_factor_bounds(name)
+    span = tested_high - tested_low
+
+    if span < 1e-10:
+        # Degenerate range — use 10% of original range around best
+        fallback_span = (original_high - original_low) * 0.1
+        return (
+            max(original_low, best_value - fallback_span / 2),
+            min(original_high, best_value + fallback_span / 2),
+        )
+
+    if abs(effect) < 1e-10:
+        # No clear direction → narrow around best
+        new_low = best_value - span * 0.3
+        new_high = best_value + span * 0.3
+    elif effect > 0:
+        # Low level better → explore below best_value
+        # best_value in upper quarter, extend range downward
+        new_low = best_value - span * 0.75
+        new_high = best_value + span * 0.25
+    else:
+        # High level better → explore above best_value
+        # best_value in lower quarter, extend range upward
+        new_low = best_value - span * 0.25
+        new_high = best_value + span * 0.75
+
+    # Clamp to hard physical bounds
+    new_low = max(original_low, new_low)
+    new_high = min(original_high, new_high)
+
+    # Minimum span: 5% of original range (prevent degenerate narrowing)
+    min_span = (original_high - original_low) * 0.05
+    if new_high - new_low < min_span:
+        center = best_value
+        new_low = max(original_low, center - min_span / 2)
+        new_high = min(original_high, center + min_span / 2)
+
+    # Integer factors: round bounds to integers
+    f = ALL_FACTORS.get(name)
+    if f and f.dtype == "int":
+        import math
+        new_low = int(math.floor(new_low))
+        new_high = int(math.ceil(new_high))
+        if new_low == new_high:
+            # Expand range: try up first, then down
+            if new_high + 1 <= int(original_high):
+                new_high += 1
+            elif new_low - 1 >= int(original_low):
+                new_low -= 1
+
+    # HEAD_DIM must be even (RoPE requires even dims)
+    if name == "HEAD_DIM":
+        new_low = int(new_low)
+        new_high = int(new_high)
+        # Round low up to even, high down to even
+        if new_low % 2 != 0:
+            new_low += 1
+        if new_high % 2 != 0:
+            new_high -= 1
+        # Ensure range is valid
+        if new_high <= new_low:
+            new_high = new_low + 2
+
+    return round(new_low, 6), round(new_high, 6)
+
+
+def make_calibrated_factor(name: str, cal_data: dict) -> Factor | None:
+    """Create a Factor with calibration-refined range from knowledge store data.
+
+    Args:
+        name: Factor name.
+        cal_data: Dict with keys 'best_value', 'range_low', 'range_high'.
+
+    Returns:
+        A Factor with narrowed range, or None if the original factor isn't found.
+    """
+    f = ALL_FACTORS.get(name)
+    if f is None:
+        return None
+    return Factor(
+        name=f.name,
+        low=cal_data["range_low"],
+        high=cal_data["range_high"],
+        baseline=cal_data["best_value"],
+        dtype=f.dtype,
+        apply_mode=f.apply_mode,
+        depends_on=f.depends_on,
+    )
 
 
 def get_muon_subfactors() -> list[Factor]:
@@ -401,7 +621,9 @@ def get_rotation_candidates(
     knowledge=None,
 ) -> list[Factor]:
     """
-    Return prioritized rotation factor candidates, excluding locked and used.
+    Return prioritized rotation factor candidates, excluding locked, used,
+    and calibrating factors (which are handled separately with priority).
+
     Priority: untested > medium-confidence re-test > low-confidence.
     """
     untested = []
@@ -413,8 +635,8 @@ def get_rotation_candidates(
             continue
         if knowledge:
             conf = knowledge.get_factor_confidence(f.name)
-            if conf in ("locked", "high"):
-                continue
+            if conf in ("locked", "high", "calibrating"):
+                continue  # Calibrating handled by get_factor_rotation step 0
             elif conf == "untested":
                 untested.append(f)
             elif conf == "medium":
