@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Runtime artifacts
+workspaces/
+results/
+*.tsv
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data cache (downloaded by prepare.py)
+~/.cache/autoresearch/
+
+# PR4 source (train.py is the active copy)
+pr4_train.py
+
+# Claude
+.claude/
