@@ -163,16 +163,18 @@ def _valid_model_dim(cfg: dict) -> bool:
 
 
 def _valid_model_dim_upper_bound(cfg: dict) -> bool:
-    """Model dim must not exceed 512 (larger causes NaN/OOM in 5-min budget).
+    """Model dim must not exceed 384 (larger can't converge in 5-min budget).
 
-    With DEPTH locked at 4, model_dim=256 is baseline (HEAD_DIM=128).
-    Allow up to 512 so HEAD_DIM calibration can explore [64, 256].
+    With DEPTH=4, ASPECT_RATIO=64, model_dim is quantized by HEAD_DIM:
+      HD=128 → 256 (baseline), HD=160 → 320, HD=176 → 352, HD=192 → 384.
+      HD=224 → 448 (too big: 25.6GB VRAM, val_bpb > 2.0, wastes compute).
+    Cap at 384 to prevent outlier-dominated generations (SE inflation 20x).
     """
     depth = int(cfg.get("DEPTH", 4))
     aspect = int(cfg.get("ASPECT_RATIO", 64))
     head_dim = int(cfg.get("HEAD_DIM", 128))
     model_dim = ((depth * aspect + head_dim - 1) // head_dim) * head_dim
-    return model_dim <= 512
+    return model_dim <= 384
 
 
 def _valid_mlp_hidden_even(cfg: dict) -> bool:
@@ -433,7 +435,7 @@ FACTOR_BOUNDS = {
     # Architecture
     "TOTAL_BATCH_SIZE_EXP": (14, 18),  # min 14 = 2^14 = 16384 (DEVICE_BS=8 * seq=2048)
     "MLP_EXPANSION": (1.0, 8.0),
-    "HEAD_DIM": (32, 256),
+    "HEAD_DIM": (32, 192),  # 192 → model_dim=384 (max trainable in 5 min)
     "VE_GATE_CHANNELS": (4, 128),
     "SHORT_WINDOW_FRAC": (0.03125, 1.0),
     "LOGIT_CAP": (5, 100),

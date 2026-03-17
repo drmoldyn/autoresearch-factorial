@@ -63,6 +63,8 @@ class GenerationStrategy:
         self._mid_epoch_locks: dict[str, float] = {}
         # Factors calibrated during this epoch (continuous factors with refined ranges)
         self._mid_epoch_calibrations: dict[str, dict] = {}
+        # Factors dropped during this epoch (prevent re-fill recycling)
+        self._epoch_dropped: set[str] = set()
         # Current factor set (evolves each generation)
         self._current_factors: list[Factor] | None = None
 
@@ -217,6 +219,7 @@ class GenerationStrategy:
                 keep.append(f)
 
         if drop_names:
+            self._epoch_dropped.update(drop_names)  # Prevent re-fill recycling
             self.log(f"  DROPPED (t<{DROP_THRESHOLD}, never significant): "
                      f"{sorted(drop_names)}")
 
@@ -263,7 +266,7 @@ class GenerationStrategy:
                 # Marginal or categorical — keep current range
                 refined.append(f)
 
-        # ------- 5. FILL freed slots -------
+        # ------- 5. FILL freed slots (excluding epoch-dropped factors) -------
         all_evolved = refined + expansion
         used_names = {f.name for f in all_evolved} | self.locked
         remaining_slots = self.max_factors - len(all_evolved)
@@ -272,7 +275,10 @@ class GenerationStrategy:
             candidates = get_rotation_candidates(
                 self.epoch, self.locked, used_names, self.knowledge,
             )
-            fill = candidates[:remaining_slots]
+            # Exclude factors dropped during this epoch to prevent
+            # drop-then-refill recycling that wastes a generation
+            fill = [f for f in candidates if f.name not in self._epoch_dropped]
+            fill = fill[:remaining_slots]
             if fill:
                 self.log(f"  FILL ({len(fill)} slots): "
                          f"{[f.name for f in fill]}")

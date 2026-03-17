@@ -344,6 +344,10 @@ class ArmWorker:
                     stderr_tail = (stderr or '')[-500:]
                     self.log(f"  [{label}] stderr: {stderr_tail[-300:]}")
                     self._recent_stderr.append(stderr_tail)
+            elif val_bpb > 2.0:
+                self.log(f"  [{label}] DIVERGED val_bpb={val_bpb:.3f} → inf | vram: {peak_vram:.0f}MB")
+                val_bpb = float("inf")
+                status = "diverged"
             else:
                 self.log(f"  [{label}] val_bpb: {val_bpb:.6f} | vram: {peak_vram:.0f}MB")
 
@@ -395,6 +399,14 @@ class ArmWorker:
                     stderr_tail = stderr[-500:] if stderr else ""
                     self.log(f"  [{label}] stderr: {stderr_tail[-300:]}")
                     self._recent_stderr.append(stderr_tail)
+            elif val_bpb > 2.0:
+                # Treat diverged runs as crashes for PB analysis.
+                # val_bpb > 2.0 means the model didn't converge (e.g.,
+                # oversized model, bad LR combo). These outliers inflate
+                # SE by 20x and corrupt effect estimates.
+                self.log(f"  [{label}] DIVERGED val_bpb={val_bpb:.3f} → inf | vram: {peak_vram:.0f}MB")
+                val_bpb = float("inf")
+                status = "diverged"
             else:
                 self.log(f"  [{label}] val_bpb: {val_bpb:.6f} | vram: {peak_vram:.0f}MB")
 
@@ -529,11 +541,11 @@ Then on the LAST LINE, output exactly one of these three words:
             direction = "better@high" if effect < 0 else "better@low"
             self.log(f"    {marker} {name}: effect={effect:.6f} t={t_ratio:.2f} ({direction})")
 
-        # Adaptive foldover — accumulate all foldover data
+        # Foldovers disabled: in iterative screening, the next generation
+        # already confirms results. Foldovers consumed 50% of wall time
+        # (2.3x overhead per gen) for marginal benefit over evolve-confirm.
         alias_struct = get_alias_structure(design, factor_names)
-        foldover_names = decide_foldovers(
-            effects, se, alias_struct, max_foldovers=4, screening_threshold=screen_t
-        )
+        foldover_names = []  # was: decide_foldovers(..., max_foldovers=4)
         foldover_responses = []
         # Track accumulated augmented design/responses across all foldovers
         augmented_design = design.copy()
