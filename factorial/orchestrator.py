@@ -650,6 +650,16 @@ Then on the LAST LINE, output exactly one of these three words:
                     self.log(f"  LOCKING {name} = {best_val} (avg effect: {effect:.6f})")
             self.knowledge.lock_factors(to_lock)
 
+        # Graduate stale factors: high-confidence but direction-inconsistent
+        # factors that have been tested extensively without ever being locked.
+        # Lock them at baseline to free design slots for new factors.
+        graduated = self.knowledge.graduate_stale_factors(
+            self.current_baseline, min_tests=10, min_sig=5,
+            log_fn=self.log,
+        )
+        if graduated:
+            self.current_baseline.update(graduated)
+
         # Propose next factor set via LLM (if enabled)
         if self.llm_mode == "llm":
             try:

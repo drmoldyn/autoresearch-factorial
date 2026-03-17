@@ -74,22 +74,28 @@ class KnowledgeStore:
             self.data["global_best_config"].update(summary.get("winner_config", {}))
 
         # Update factor history
+        sig_set = set(summary.get("significant_factors", []))
         for name in summary.get("factors_tested", []):
             if name not in self.data["factor_history"]:
                 self.data["factor_history"][name] = {
                     "tested_epochs": [],
                     "effect_sizes": [],
+                    "significant_effect_sizes": [],
                     "significant_count": 0,
                     "total_tests": 0,
                 }
             hist = self.data["factor_history"][name]
+            # Ensure significant_effect_sizes exists (upgrade old format)
+            if "significant_effect_sizes" not in hist:
+                hist["significant_effect_sizes"] = []
             if epoch not in hist["tested_epochs"]:
                 hist["tested_epochs"].append(epoch)
             effect = summary.get("effects", {}).get(name, 0)
             hist["effect_sizes"].append(effect)
             hist["total_tests"] += 1
-            if name in summary.get("significant_factors", []):
+            if name in sig_set:
                 hist["significant_count"] += 1
+                hist["significant_effect_sizes"].append(effect)
 
         self._save()
 
@@ -185,15 +191,10 @@ class KnowledgeStore:
         """
         Suggest factors that should be locked based on accumulated evidence.
 
-        Uses a stricter bar than screening (default t > 2.5 vs screening t > 1.5)
-        because locking is hard to reverse. A factor is a lock candidate if:
-        - Tested >= 2 times
-        - Significant (at screening level) >= 2 times
-        - Effect direction is consistent
-        - Average |effect| suggests reliable detection
-
-        The locking_threshold parameter controls the minimum evidence level.
-        Aligned with Lenth (1989) SME for ~19 contrasts.
+        A factor is a lock candidate if:
+        - Significant >= 2 times
+        - Effect direction is consistent in ≥75% of significant tests
+          (insignificant runs produce near-zero noise with random sign)
 
         Args:
             locking_threshold: Not used for direct t-ratio comparison here
@@ -204,18 +205,63 @@ class KnowledgeStore:
         for name, hist in self.data.get("factor_history", {}).items():
             if name in self.data.get("locked_factors", {}):
                 continue
-            # Require tested >= 2 times and significant >= 2 times
-            # (significance was determined at the screening threshold)
-            if hist["total_tests"] >= 2 and hist["significant_count"] >= 2:
-                effects = hist["effect_sizes"]
-                # Check direction consistency — all non-zero effects same sign
-                signs = [1 if e > 0 else -1 for e in effects if e != 0]
-                if signs and all(s == signs[0] for s in signs):
+            if hist["significant_count"] >= 2:
+                # Use significant-only effects if available, else all effects
+                effects = hist.get("significant_effect_sizes",
+                                   hist.get("effect_sizes", []))
+                nonzero = [e for e in effects if e != 0]
+                if not nonzero:
+                    continue
+                # Supermajority direction check (≥75% same sign)
+                n_pos = sum(1 for e in nonzero if e > 0)
+                n_neg = len(nonzero) - n_pos
+                dominant = max(n_pos, n_neg)
+                if dominant / len(nonzero) >= 0.75:
                     avg_effect = sum(effects) / len(effects)
                     candidates.append((name, avg_effect))
 
         candidates.sort(key=lambda x: abs(x[1]), reverse=True)
         return candidates
+
+    def graduate_stale_factors(
+        self,
+        baseline: dict[str, float],
+        min_tests: int = 10,
+        min_sig: int = 5,
+        log_fn=None,
+    ) -> dict[str, float]:
+        """
+        Auto-lock factors that are high-confidence but can never pass the
+        direction consistency check for locking. These factors have been
+        tested many times (significant enough to qualify) but their effect
+        direction is too noisy to establish a clear best level.
+
+        Rather than wasting design slots testing them forever, graduate
+        them to locked at their baseline value. The baseline is already
+        the best-performing config, so this is safe.
+
+        Returns dict of graduated factor names -> locked values.
+        """
+        log = log_fn or (lambda msg: None)
+        graduated = {}
+        for name, hist in self.data.get("factor_history", {}).items():
+            if name in self.data.get("locked_factors", {}):
+                continue
+            total = hist.get("total_tests", 0)
+            sig = hist.get("significant_count", 0)
+            if total >= min_tests and sig >= min_sig:
+                # This factor has been tested extensively and is significant,
+                # but hasn't been locked (likely due to direction inconsistency).
+                # Graduate it to locked at baseline.
+                lock_val = baseline.get(name)
+                if lock_val is not None:
+                    graduated[name] = lock_val
+                    log(f"  GRADUATED (tested {total}x, sig {sig}x, "
+                        f"direction inconsistent): {name} = {lock_val}")
+
+        if graduated:
+            self.lock_factors(graduated)
+        return graduated
 
     def get_active_fraction(self, lookback: int = 5, learning_rate: float = 0.2) -> float:
         """

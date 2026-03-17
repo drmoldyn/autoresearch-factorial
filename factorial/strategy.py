@@ -243,8 +243,9 @@ class GenerationStrategy:
 
         A factor qualifies for mid-epoch lock when:
         - Significant in ≥2 cumulative tests (this epoch + historical)
-        - Effect direction is consistent in all tests
-        - t-ratio exceeds the locking threshold (stricter than screening)
+        - Effect direction is consistent in SIGNIFICANT tests (≥75% same sign)
+        - Insignificant runs produce random noise and are excluded from
+          the direction check to prevent false negatives.
         """
         if not self._gen_results:
             return {}
@@ -252,16 +253,16 @@ class GenerationStrategy:
         pi = self.knowledge.get_active_fraction()
         lock_t = adaptive_locking_threshold(pi)
 
-        # Count significance across this epoch's generations
+        # Count significance and collect significant-only effects
         epoch_sig_count: dict[str, int] = {}
-        epoch_effects: dict[str, list[float]] = {}
+        epoch_sig_effects: dict[str, list[float]] = {}
         for r in self._gen_results:
             for name in r["significant"]:
                 epoch_sig_count[name] = epoch_sig_count.get(name, 0) + 1
-            for name, eff in r["effects"].items():
-                if name not in epoch_effects:
-                    epoch_effects[name] = []
-                epoch_effects[name].append(eff)
+                eff = r["effects"].get(name, 0)
+                if name not in epoch_sig_effects:
+                    epoch_sig_effects[name] = []
+                epoch_sig_effects[name].append(eff)
 
         # Combine with historical knowledge
         new_locks = {}
@@ -274,20 +275,27 @@ class GenerationStrategy:
             # Historical significance from knowledge store
             hist = self.knowledge.data.get("factor_history", {}).get(name, {})
             hist_sig = hist.get("significant_count", 0)
-            hist_effects = hist.get("effect_sizes", [])
+            hist_sig_effects = hist.get("significant_effect_sizes", [])
+            # Fallback: if no significant_effect_sizes tracked, use all effects
+            if not hist_sig_effects:
+                hist_sig_effects = hist.get("effect_sizes", [])
 
             total_sig = epoch_count + hist_sig
             if total_sig < 2:
                 continue  # Need ≥2 significant tests
 
-            # Check direction consistency
-            all_effects = hist_effects + epoch_effects.get(name, [])
-            nonzero = [e for e in all_effects if e != 0]
+            # Direction consistency: ≥75% of SIGNIFICANT effects same sign
+            # Only check effects from significant tests — insignificant runs
+            # produce near-zero effects with random sign that poison the check
+            sig_effects = hist_sig_effects + epoch_sig_effects.get(name, [])
+            nonzero = [e for e in sig_effects if e != 0]
             if not nonzero:
                 continue
-            signs = [1 if e > 0 else -1 for e in nonzero]
-            if not all(s == signs[0] for s in signs):
-                continue  # Direction inconsistent — don't lock
+            n_pos = sum(1 for e in nonzero if e > 0)
+            n_neg = len(nonzero) - n_pos
+            dominant_count = max(n_pos, n_neg)
+            if dominant_count / len(nonzero) < 0.75:
+                continue  # Direction too inconsistent — don't lock
 
             # Get the best value to lock at
             lock_val = latest_winner.get(name)

@@ -48,32 +48,38 @@ class Factor:
 
 
 # ---------------------------------------------------------------------------
-# Epoch 0 factors: 19 factors screened in a 20-run PB design
-# Ordered by expected impact (high → medium → exploratory)
+# Epoch 0 factors: 11 factors screened in a 12-run PB design
+# Baselines from validated best config (val_bpb=1.2413, 2026-03-17)
+# Locked: USE_MUON=1, DEPTH=4, DEVICE_BATCH_SIZE=8, LOGIT_CAP=30,
+#         EMBED_WD=0, ASPECT_RATIO=64
 # ---------------------------------------------------------------------------
 
 EPOCH_0_FACTORS = [
-    # High-impact — baseline from leaderboard (M4 Max val_bpb=1.294)
-    # DEPTH [3,4]: DEPTH>=5 → model_dim jumps 256→384 → NaN in 5-min budget
-    Factor("DEPTH", low=3, high=4, baseline=4, dtype="int"),
-    # EXP low=15 (not 14): EXP=14 + BS>=16 violates grad_accum constraint
-    Factor("TOTAL_BATCH_SIZE_EXP", low=15, high=17, baseline=16, dtype="int"),
+    # Core hyperparameters — re-screen at the new (much stronger) baseline
+    # EXP=14 now safe: DBS=8 locked, 2^14/(8*2048)=1 ✓
+    Factor("TOTAL_BATCH_SIZE_EXP", low=14, high=16, baseline=15, dtype="int"),
     # ^ stored as exponent: actual = 2**value
-    Factor("EMBEDDING_LR", low=0.3, high=0.8, baseline=0.6),
+    Factor("EMBEDDING_LR", low=0.1, high=0.6, baseline=0.3),
     Factor("WEIGHT_DECAY", low=0.05, high=0.4, baseline=0.2),
-    Factor("MATRIX_LR", low=0.02, high=0.06, baseline=0.04),
+    Factor("MATRIX_LR", low=0.02, high=0.08, baseline=0.05),
 
-    # Medium-impact (schedule & optimizer)
+    # Schedule & optimizer
     Factor("WARMDOWN_RATIO", low=0.3, high=0.7, baseline=0.5),
-    Factor("ADAM_BETA1", low=0.7, high=0.9, baseline=0.8),
-    Factor("ADAM_BETA2", low=0.90, high=0.99, baseline=0.95),
-    Factor("X0_LAMBDA_INIT", low=0.03, high=0.15, baseline=0.1),
+    Factor("X0_LAMBDA_INIT", low=0.05, high=0.25, baseline=0.15),
 
-    # High-value rotation factors promoted to epoch 0 (need re-test at new baseline)
-    Factor("USE_MUON", low=0, high=1, baseline=0, dtype="categorical"),
+    # Released from lock — re-test at new baseline
+    Factor("ADAM_BETA2", low=0.85, high=0.99, baseline=0.9),
+    Factor("WINDOW_PATTERN", low=0, high=1, baseline=0, dtype="categorical",
+           apply_mode="code:window_pattern"),
+    # 0 = "SL", 1 = "SSSL"
+    Factor("HEAD_DIM", low=64, high=128, baseline=128, dtype="int"),
+
+    # Architecture — significant but needs re-test at new baseline
     Factor("ACTIVATION", low=0, high=1, baseline=1, dtype="categorical",
            apply_mode="code:activation"),
     # 0 = gelu, 1 = relu_sq
+    Factor("MLP_EXPANSION", low=2.66, high=4.0, baseline=4.0),
+    # low nudged from 2.67: int(2.67*256)=683 (odd), int(2.66*256)=680 (even)
 ]
 
 # ---------------------------------------------------------------------------
@@ -81,38 +87,30 @@ EPOCH_0_FACTORS = [
 # ---------------------------------------------------------------------------
 
 ROTATION_FACTORS = [
-    # Muon sub-factors (conditional on USE_MUON)
-    Factor("NS_STEPS", low=3, high=5, baseline=5, dtype="int",
+    # Muon sub-factors (conditional on USE_MUON — locked at 1, so always active)
+    Factor("NS_STEPS", low=3, high=7, baseline=5, dtype="int",
            depends_on=("USE_MUON", 1)),
     Factor("MUON_MOMENTUM", low=0.80, high=0.95, baseline=0.85,
            depends_on=("USE_MUON", 1)),
-    Factor("MUON_BETA2", low=0.9, high=0.999, baseline=0.99,
+    Factor("MUON_BETA2", low=0.90, high=0.999, baseline=0.97425,
            depends_on=("USE_MUON", 1)),
 
-    # Architecture refinement
-    Factor("LOGIT_CAP", low=5, high=30, baseline=15),
-    Factor("MLP_EXPANSION", low=2.66, high=4.0, baseline=4.0),
-    # low nudged from 2.67: int(2.67*256)=683 (odd), int(2.66*256)=680 (even)
-    Factor("VE_GATE_CHANNELS", low=16, high=64, baseline=32, dtype="int"),
-    Factor("HEAD_DIM", low=64, high=128, baseline=128, dtype="int"),
-    Factor("ASPECT_RATIO", low=48, high=80, baseline=64, dtype="int"),
-    Factor("SHORT_WINDOW_FRAC", low=0.125, high=0.5, baseline=0.5),
-    Factor("LM_HEAD_WD", low=0.0, high=0.01, baseline=0.0),
+    # Optimizer & learning rates
+    Factor("ADAM_BETA1", low=0.7, high=0.9, baseline=0.8),
+    Factor("SCALAR_LR", low=0.1, high=0.5, baseline=0.3),
+    Factor("UNEMBEDDING_LR", low=0.001, high=0.008, baseline=0.004),
 
-    # Demoted from epoch 0 (consistently insignificant in v1, re-test later)
+    # Architecture refinement
+    Factor("VE_GATE_CHANNELS", low=16, high=80, baseline=52, dtype="int"),
+    Factor("SHORT_WINDOW_FRAC", low=0.0625, high=0.5, baseline=0.125),
+    Factor("LM_HEAD_WD", low=0.0, high=0.01, baseline=0.0025),
+
+    # Lower-priority (mostly insignificant in v1, but re-test at new baseline)
     Factor("ROPE_BASE", low=10000, high=200000, baseline=10000),
-    Factor("EMBED_WD", low=0.0, high=0.002, baseline=0.0),
     Factor("VE_WD", low=0.0, high=0.003, baseline=0.0),
-    Factor("INIT_SCALE", low=1.0, high=5.0, baseline=3.0),
-    Factor("UNEMBEDDING_LR", low=0.002, high=0.008, baseline=0.004),
-    Factor("WINDOW_PATTERN", low=0, high=1, baseline=1, dtype="categorical",
-           apply_mode="code:window_pattern"),
-    # 0 = "SL", 1 = "SSSL"
-    # high=16: DBS*2048 must ≤ 2^EXP; with EXP=15, max DBS=16
-    Factor("DEVICE_BATCH_SIZE", low=8, high=16, baseline=16, dtype="int"),
+    Factor("INIT_SCALE", low=1.0, high=6.0, baseline=4.0),
     Factor("FINAL_LR_FRAC", low=0.0, high=0.15, baseline=0.0),
     Factor("WARMUP_RATIO", low=0.0, high=0.05, baseline=0.0),
-    Factor("SCALAR_LR", low=0.3, high=0.7, baseline=0.5),
 ]
 
 # ---------------------------------------------------------------------------
@@ -342,17 +340,27 @@ def get_factor_rotation(
                 available.append(refined)
                 used_names.add(f.name)
 
-    # 3. Remaining untested rotation factors (even if not highest priority)
+    # 3. Low-confidence rotation factors (tested but not yet significant enough)
     for f in ROTATION_FACTORS:
-        if f.name not in locked_factors and f.name not in used_names:
-            available.append(f)
-            used_names.add(f.name)
+        if f.name in locked_factors or f.name in used_names:
+            continue
+        if knowledge_store:
+            confidence = knowledge_store.get_factor_confidence(f.name)
+            if confidence in ("high", "locked"):
+                continue  # Don't re-test high-confidence factors endlessly
+        available.append(f)
+        used_names.add(f.name)
 
-    # 4. Fill remaining slots with unlocked epoch-0 factors
+    # 4. Fill remaining slots with unlocked, non-high-confidence epoch-0 factors
     for f in EPOCH_0_FACTORS:
-        if f.name not in locked_factors and f.name not in used_names:
-            available.append(f)
-            used_names.add(f.name)
+        if f.name in locked_factors or f.name in used_names:
+            continue
+        if knowledge_store:
+            confidence = knowledge_store.get_factor_confidence(f.name)
+            if confidence in ("high", "locked"):
+                continue
+        available.append(f)
+        used_names.add(f.name)
 
     # Limit to 19 factors (20-run PB design)
     return available[:19]
