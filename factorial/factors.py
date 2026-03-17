@@ -105,6 +105,16 @@ ROTATION_FACTORS = [
     Factor("SHORT_WINDOW_FRAC", low=0.0625, high=0.5, baseline=0.125),
     Factor("LM_HEAD_WD", low=0.0, high=0.01, baseline=0.0025),
 
+    # New v2 factors — untested architectural/optimizer choices
+    Factor("KV_HEAD_RATIO", low=0, high=1, baseline=1, dtype="categorical",
+           apply_mode="code:kv_head_ratio"),
+    # 0 = MQA (n_kv_head=1), 1 = full MHA (n_kv_head=n_head)
+    Factor("CAUTIOUS_WD", low=0, high=1, baseline=1, dtype="categorical",
+           apply_mode="code:cautious_wd"),
+    # 0 = standard WD, 1 = cautious WD (mask by gradient-param alignment)
+    Factor("RESID_LR_RATIO", low=0.001, high=0.1, baseline=0.01),
+    # Multiplier on SCALAR_LR for resid_lambdas
+
     # Lower-priority (mostly insignificant in v1, but re-test at new baseline)
     Factor("ROPE_BASE", low=10000, high=200000, baseline=10000),
     Factor("VE_WD", low=0.0, high=0.003, baseline=0.0),
@@ -449,4 +459,6 @@ CATEGORICAL_VALUES = {
     "WINDOW_PATTERN": {0: "SL", 1: "SSSL"},
     "ACTIVATION": {0: "gelu", 1: "relu_sq"},
     "USE_MUON": {0: False, 1: True},
+    "KV_HEAD_RATIO": {0: "mqa", 1: "mha"},
+    "CAUTIOUS_WD": {0: "standard", 1: "cautious"},
 }

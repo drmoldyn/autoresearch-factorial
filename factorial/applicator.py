@@ -214,6 +214,54 @@ def _replace_mlp_expansion(content: str, value: float) -> str:
     return new_content
 
 
+def _replace_kv_head_ratio(content: str, value) -> str:
+    """Replace n_kv_head assignment: MQA (1 KV head) vs full MHA (n_head KV heads)."""
+    if isinstance(value, (int, float)):
+        value = int(value)
+    # Current: n_kv_head=model_dim // HEAD_DIM,
+    if value == 0:
+        # MQA: single KV head regardless of n_head
+        replacement = "n_kv_head=1,"
+    else:
+        # Full MHA: n_kv_head = n_head
+        replacement = "n_kv_head=model_dim // HEAD_DIM,"
+    pattern = r'n_kv_head\s*=\s*[^,]+,'
+    new_content, count = re.subn(pattern, replacement, content, count=1)
+    if count == 0:
+        raise ValueError("Could not find n_kv_head= in train.py")
+    return new_content
+
+
+def _replace_cautious_wd(content: str, value) -> str:
+    """Toggle cautious weight decay in Muon optimizer.
+    0 = standard WD (mask=1), 1 = cautious WD (mask by gradient-param alignment).
+    """
+    if isinstance(value, (int, float)):
+        value = int(value)
+    if value == 0:
+        # Standard WD: mask is always 1 (apply WD everywhere)
+        new_line = "            mask = mx.ones_like(stacked_params)"
+    else:
+        # Cautious WD: mask by gradient-param sign alignment
+        new_line = "            mask = (g * stacked_params >= 0).astype(mx.float32)"
+    pattern = r' {12}mask = .*(?:ones_like|stacked_params >= 0).*'
+    new_content, count = re.subn(pattern, new_line, content, count=1)
+    if count == 0:
+        raise ValueError("Could not find cautious WD mask line in train.py")
+    return new_content
+
+
+def _replace_resid_lr_ratio(content: str, value: float) -> str:
+    """Replace the resid_lambdas LR multiplier (scalar_lr * ratio)."""
+    # Match: "lr": scalar_lr * 0.01, in the resid_lambdas section
+    pattern = r'("resid_lambdas"[\s\S]*?"lr":\s*scalar_lr\s*\*\s*)([\d.]+)'
+    replacement = rf'\g<1>{value:.10g}'
+    new_content, count = re.subn(pattern, replacement, content, count=1)
+    if count == 0:
+        raise ValueError("Could not find resid_lambdas LR ratio in train.py")
+    return new_content
+
+
 def _replace_activation(content: str, value) -> str:
     """Replace activation function in MLP.__call__."""
     if isinstance(value, (int, float)):
@@ -340,6 +388,20 @@ def apply_config(config: dict, train_py_path: str | Path) -> list[str]:
                     changes.append(f"activation = {mapping.get(int(value), 'gelu')}")
                 else:
                     changes.append(f"activation = {value}")
+
+            elif factor_name == "KV_HEAD_RATIO":
+                content = _replace_kv_head_ratio(content, value)
+                label = "MQA (1 KV head)" if int(value) == 0 else "full MHA"
+                changes.append(f"KV heads = {label}")
+
+            elif factor_name == "CAUTIOUS_WD":
+                content = _replace_cautious_wd(content, value)
+                label = "standard" if int(value) == 0 else "cautious"
+                changes.append(f"weight decay = {label}")
+
+            elif factor_name == "RESID_LR_RATIO":
+                content = _replace_resid_lr_ratio(content, float(value))
+                changes.append(f"resid_lambdas LR ratio = {value}")
 
             elif const_name is not None:
                 content = _replace_constant(content, const_name, value)
