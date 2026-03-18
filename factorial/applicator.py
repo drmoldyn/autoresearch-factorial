@@ -45,6 +45,9 @@ FACTOR_TO_CONSTANT = {
     "LM_HEAD_WD": None,  # Special: weight decay for lm_head
     "MLP_EXPANSION": None,  # Special: MLP hidden dim ratio
     "ACTIVATION": None,  # Special: code block swap
+    "Z_LOSS_WEIGHT": "Z_LOSS_WEIGHT",
+    "EMBEDDING_TIE": "EMBEDDING_TIE",
+    "SPARSE_ATTN_GATE": "SPARSE_ATTN_GATE",
 }
 
 
@@ -404,6 +407,18 @@ def apply_config(config: dict, train_py_path: str | Path) -> list[str]:
                 content = _replace_resid_lr_ratio(content, float(value))
                 changes.append(f"resid_lambdas LR ratio = {value}")
 
+            elif factor_name == "EMBEDDING_TIE":
+                bool_val = bool(int(value))
+                content = _replace_constant(content, "EMBEDDING_TIE", bool_val)
+                label = "tied" if bool_val else "untied"
+                changes.append(f"embedding = {label}")
+
+            elif factor_name == "SPARSE_ATTN_GATE":
+                bool_val = bool(int(value))
+                content = _replace_constant(content, "SPARSE_ATTN_GATE", bool_val)
+                label = "on" if bool_val else "off"
+                changes.append(f"sparse attn gate = {label}")
+
             elif const_name is not None:
                 content = _replace_constant(content, const_name, value)
                 changes.append(f"{const_name} = {value}")
@@ -443,6 +458,7 @@ def read_current_config(train_py_path: str | Path) -> dict:
         "WARMDOWN_RATIO", "UNEMBEDDING_LR", "DEVICE_BATCH_SIZE",
         "FINAL_LR_FRAC", "WARMUP_RATIO", "SCALAR_LR",
         "HEAD_DIM", "ASPECT_RATIO", "NS_STEPS", "MUON_MOMENTUM", "MUON_BETA2",
+        "Z_LOSS_WEIGHT",
     ]
     for name in simple_constants:
         m = re.search(rf'^{re.escape(name)}\s*=\s*(.+)$', content, re.MULTILINE)
@@ -531,5 +547,14 @@ def read_current_config(train_py_path: str | Path) -> dict:
             config["ACTIVATION"] = "relu_sq"
         elif "silu" in act_code:
             config["ACTIVATION"] = "swiglu"
+
+    # Boolean architecture toggles
+    for bool_name, factor_name in [
+        ("EMBEDDING_TIE", "EMBEDDING_TIE"),
+        ("SPARSE_ATTN_GATE", "SPARSE_ATTN_GATE"),
+    ]:
+        m = re.search(rf'^{bool_name}\s*=\s*(True|False)', content, re.MULTILINE)
+        if m:
+            config[factor_name] = 1 if m.group(1) == "True" else 0
 
     return config

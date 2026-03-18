@@ -61,11 +61,14 @@ EPOCH_0_FACTORS = [
     # ^ stored as exponent: actual = 2**value
     Factor("EMBEDDING_LR", low=0.1, high=0.6, baseline=0.3),
     Factor("WEIGHT_DECAY", low=0.05, high=0.4, baseline=0.2),
-    Factor("MATRIX_LR", low=0.02, high=0.08, baseline=0.05),
+    # MATRIX_LR locked at 0.05 — 4 tests, 0 sig, near-optimal per modded-nanogpt
 
     # Schedule & optimizer
-    Factor("WARMDOWN_RATIO", low=0.3, high=0.7, baseline=0.5),
-    Factor("X0_LAMBDA_INIT", low=0.05, high=0.25, baseline=0.15),
+    Factor("WARMDOWN_RATIO", low=0.3, high=1.0, baseline=0.5),
+    # ^ Expanded to 1.0 — "Straight to Zero" paper supports full linear decay
+    # X0_LAMBDA_INIT locked at 0.15 — 4 tests, 0 sig, converges regardless
+    # WARMUP_RATIO locked at 0.0 — research confirms no warmup optimal
+    # FINAL_LR_FRAC locked at 0.0 — "Straight to Zero" confirms decay to 0
 
     # Released from lock — re-test at new baseline
     Factor("ADAM_BETA2", low=0.85, high=0.99, baseline=0.9),
@@ -118,13 +121,19 @@ ROTATION_FACTORS = [
     # Formerly locked continuous — now unlocked for calibration
     Factor("LOGIT_CAP", low=15, high=45, baseline=30),
     Factor("EMBED_WD", low=0.0, high=0.005, baseline=0.0),
-
-    # Lower-priority (mostly insignificant in v1, but re-test at new baseline)
-    Factor("ROPE_BASE", low=10000, high=200000, baseline=10000),
-    Factor("VE_WD", low=0.0, high=0.003, baseline=0.0),
     Factor("INIT_SCALE", low=1.0, high=6.0, baseline=4.0),
-    Factor("FINAL_LR_FRAC", low=0.0, high=0.15, baseline=0.0),
-    Factor("WARMUP_RATIO", low=0.0, high=0.05, baseline=0.0),
+    # ROPE_BASE locked at 10000 — 9 tests, 0 sig
+    # VE_WD locked at 0.0 — 6 tests, 0 sig
+    # FINAL_LR_FRAC locked at 0.0 — 5 tests, 0 sig
+    # WARMUP_RATIO locked at 0.0 — 5 tests, 1 marginal sig
+
+    # New research-informed factors (modded-nanogpt, PaLM, Gemma)
+    Factor("Z_LOSS_WEIGHT", low=0.0, high=0.01, baseline=0.0),
+    # Z-loss: gradient-based logit stability (replaces hard capping)
+    Factor("EMBEDDING_TIE", low=0, high=1, baseline=0, dtype="categorical"),
+    # 0 = untied wte/lm_head, 1 = tied (shared weights)
+    Factor("SPARSE_ATTN_GATE", low=0, high=1, baseline=0, dtype="categorical"),
+    # 0 = no gate, 1 = sigmoid gate per head (modded-nanogpt PR #117)
 ]
 
 # ---------------------------------------------------------------------------
@@ -449,6 +458,8 @@ FACTOR_BOUNDS = {
     "ROPE_BASE": (1000, 1000000),
     "VE_WD": (0.0, 0.01),
     "EMBED_WD": (0.0, 0.01),
+    # New research-informed factors
+    "Z_LOSS_WEIGHT": (0.0, 0.1),
 }
 
 
@@ -637,8 +648,8 @@ def get_rotation_candidates(
             continue
         if knowledge:
             conf = knowledge.get_factor_confidence(f.name)
-            if conf in ("locked", "high", "calibrating"):
-                continue  # Calibrating handled by get_factor_rotation step 0
+            if conf in ("locked", "high", "calibrating", "dead"):
+                continue  # Dead: tested ≥4x, never significant — retired
             elif conf == "untested":
                 untested.append(f)
             elif conf == "medium":
@@ -685,4 +696,6 @@ CATEGORICAL_VALUES = {
     "USE_MUON": {0: False, 1: True},
     "KV_HEAD_RATIO": {0: "mqa", 1: "mha"},
     "CAUTIOUS_WD": {0: "standard", 1: "cautious"},
+    "EMBEDDING_TIE": {0: "untied", 1: "tied"},
+    "SPARSE_ATTN_GATE": {0: "off", 1: "on"},
 }

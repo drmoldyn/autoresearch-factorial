@@ -213,11 +213,12 @@ class KnowledgeStore:
     def get_factor_confidence(self, name: str) -> str:
         """
         Return confidence level for a factor:
-        "locked", "calibrating", "high", "medium", "low", "untested".
+        "locked", "calibrating", "high", "medium", "low", "dead", "untested".
 
         Locked: binary/categorical factors permanently set.
         Calibrating: continuous factors with proven significance undergoing
                      directed range refinement (never removed from design).
+        Dead: tested ≥4 times with 0 significant results — retired from rotation.
         """
         if name in self.data.get("locked_factors", {}):
             return "locked"
@@ -234,6 +235,8 @@ class KnowledgeStore:
 
         if total >= 3 and sig >= 2:
             return "high"
+        elif total >= 4 and sig == 0:
+            return "dead"  # Tested enough times, never significant — retire
         elif total >= 2 and sig >= 1:
             return "medium"
         elif total >= 1:

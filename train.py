@@ -86,6 +86,8 @@ class CausalSelfAttention(nn.Module):
             else None
         )
         self.rope = nn.RoPE(self.head_dim, traditional=True, base=10000)
+        if SPARSE_ATTN_GATE:
+            self.attn_gate = nn.Linear(12, self.n_head, bias=False)
 
     def __call__(self, x, ve, mask):
         batch_size, seq_len, _ = x.shape
@@ -108,6 +110,11 @@ class CausalSelfAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.head_dim)
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
         y = y.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+        if SPARSE_ATTN_GATE:
+            gate = mx.sigmoid(self.attn_gate(x[..., :12]))  # (B, T, n_head)
+            y = y.reshape(batch_size, seq_len, self.n_head, self.head_dim)
+            y = y * mx.expand_dims(gate, axis=-1)
+            y = y.reshape(batch_size, seq_len, -1)
         return self.c_proj(y)
 
 
@@ -144,6 +151,8 @@ class GPT(nn.Module):
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.blocks = [Block(config, i) for i in range(config.n_layer)]
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        if EMBEDDING_TIE:
+            self.lm_head.weight = self.wte.weight
         self.resid_lambdas = mx.ones((config.n_layer,), dtype=mx.float32)
         self.x0_lambdas = mx.zeros((config.n_layer,), dtype=mx.float32)
         head_dim = config.n_embd // config.n_head
@@ -160,7 +169,8 @@ class GPT(nn.Module):
         scale = 4**0.5 * n_embd**-0.5
 
         self.wte.weight = (mx.random.normal(self.wte.weight.shape) * 1.0).astype(mx.bfloat16)
-        self.lm_head.weight = (mx.random.normal(self.lm_head.weight.shape) * 0.001).astype(mx.bfloat16)
+        if not EMBEDDING_TIE:
+            self.lm_head.weight = (mx.random.normal(self.lm_head.weight.shape) * 0.001).astype(mx.bfloat16)
 
         for block in self.blocks:
             block.attn.c_q.weight = mx.random.uniform(-scale, scale, block.attn.c_q.weight.shape).astype(mx.bfloat16)
@@ -171,6 +181,8 @@ class GPT(nn.Module):
             block.mlp.c_proj.weight = mx.zeros_like(block.mlp.c_proj.weight).astype(mx.bfloat16)
             if block.attn.ve_gate is not None:
                 block.attn.ve_gate.weight = mx.zeros_like(block.attn.ve_gate.weight).astype(mx.bfloat16)
+            if SPARSE_ATTN_GATE and hasattr(block.attn, 'attn_gate'):
+                block.attn.attn_gate.weight = mx.zeros_like(block.attn.attn_gate.weight).astype(mx.bfloat16)
 
         self.resid_lambdas = mx.ones((self.config.n_layer,), dtype=mx.float32)
         self.x0_lambdas = mx.full((self.config.n_layer,), 0.15, dtype=mx.float32)
@@ -228,7 +240,12 @@ class GPT(nn.Module):
         if reduction == "none":
             return ce
         denom = mx.maximum(mx.sum(valid), 1)
-        return mx.sum(ce) / denom
+        loss = mx.sum(ce) / denom
+        if Z_LOSS_WEIGHT > 0:
+            # Z-loss: gradient-based logit stability (PaLM, Gemma)
+            log_z = mx.log(mx.sum(mx.exp(logits), axis=-1))
+            loss = loss + Z_LOSS_WEIGHT * mx.mean(log_z ** 2)
+        return loss
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +284,12 @@ class MuonAdamW:
                 if shape not in muon_paths_by_shape:
                     muon_paths_by_shape[shape] = []
                 muon_paths_by_shape[shape].append(path)
+            elif "attn_gate" in path:
+                # Sparse attention gate: small scalar-like mapping, use AdamW
+                self.param_config[path] = {
+                    "kind": "adamw", "lr": scalar_lr,
+                    "betas": adam_betas, "eps": 1e-10, "weight_decay": 0.0,
+                }
             elif "blocks" in path and param.ndim == 2:
                 self.param_config[path] = {
                     "kind": "adamw", "lr": matrix_lr,
@@ -505,6 +528,11 @@ ADAM_BETAS = (0.8, 0.9)
 WARMUP_RATIO = 0
 WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0
+
+# Architecture features
+Z_LOSS_WEIGHT = 0.0
+EMBEDDING_TIE = False
+SPARSE_ATTN_GATE = False
 
 # Model size
 DEPTH = 4
