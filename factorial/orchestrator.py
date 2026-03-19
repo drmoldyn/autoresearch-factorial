@@ -54,6 +54,7 @@ from .factors import (
     fix_config,
     get_factor_rotation,
 )
+from .effect_bank import EffectBank
 from .knowledge import KnowledgeStore
 from .strategy import GenerationStrategy
 
@@ -92,6 +93,9 @@ class ArmWorker:
         self.llm_proposed_factors: list[Factor] | None = None
         self.max_parallel = max_parallel if max_parallel > 0 else self._detect_parallel_budget()
         self._recent_stderr: list[str] = []  # Collected by circuit breaker
+
+        # Effect bank: pooled cross-generation meta-analysis
+        self.effect_bank = EffectBank(self.results_dir, log_fn=self.log)
 
         # Ensure results TSV exists with header
         if not self.results_tsv.exists():
@@ -601,6 +605,9 @@ Then on the LAST LINE, output exactly one of these three words:
         )
         self.knowledge.record_generation(self.epoch, self.generation, summary)
 
+        # Feed to effect bank for pooled meta-analysis
+        self.effect_bank.ingest_generation(summary, design, responses_arr)
+
         # Save effects JSON
         effects_dir = self.results_dir / "effects"
         effects_dir.mkdir(parents=True, exist_ok=True)
@@ -613,13 +620,11 @@ Then on the LAST LINE, output exactly one of these three words:
         self.log(f"  Winner config (significant factors): "
                  f"{summary.get('winner_config', {})}")
 
-        # Update baseline with winner values for SIGNIFICANT factors only.
-        # Non-significant factors stay at current baseline (don't adopt PB
-        # extreme values that happened to be in the best run by chance).
+        # BASELINE FROZEN: Do NOT mutate self.current_baseline here.
+        # The baseline stays constant within an epoch so all generations
+        # screen against the same reference. Changes are applied only at
+        # the epoch boundary after validation gating.
         sig_factors = set(summary.get("significant_factors", []))
-        for name, value in winner.items():
-            if name in sig_factors or name in self.knowledge.get_locked_factors():
-                self.current_baseline[name] = value
 
         gen_elapsed = time.monotonic() - gen_start_time
 
@@ -719,31 +724,31 @@ Then on the LAST LINE, output exactly one of these three words:
             latest_summary = self._get_latest_generation_summary()
             strategy.record_generation_result(g, latest_summary, winner)
 
-            # Apply any mid-epoch locks to baseline
-            mid_locks = strategy.get_mid_epoch_locks()
-            if mid_locks:
-                self.current_baseline.update(mid_locks)
+            # Mid-epoch locks/calibrations are recorded in the knowledge
+            # store by the strategy module, but do NOT mutate the baseline.
+            # The baseline stays frozen until the epoch boundary.
 
-            # Apply calibration best values to baseline
-            mid_cals = strategy.get_mid_epoch_calibrations()
-            for name, cal_data in mid_cals.items():
-                self.current_baseline[name] = cal_data["best_value"]
-
-        # FACTOR RESET -- epoch boundary
-        # Update baseline with locked factor values (high confidence) only.
-        # Do NOT blindly adopt epoch_best["config"] — that's a PB run with
-        # half its factors at extreme values. The evolved baseline (built from
-        # significant-factor-only updates across generations) is more reliable.
+        # EPOCH BOUNDARY: propose → promote → validate → gate
+        # The baseline was FROZEN during all generations. Now we build a
+        # proposed baseline from accumulated knowledge, validate it, and
+        # only adopt it if validation doesn't regress.
         epoch_best = self.knowledge.get_epoch_best(self.epoch)
-        locked_factors = self.knowledge.get_locked_factors()
-        for name, value in locked_factors.items():
-            self.current_baseline[name] = value
 
-        # Also apply calibrating factor best values to baseline
-        for name, cal_data in self.knowledge.get_calibrating_factors().items():
-            self.current_baseline[name] = cal_data["best_value"]
+        # 1. BUILD PROPOSED BASELINE via Effect Bank (interaction-aware)
+        # The effect bank uses pooled main effects + interaction contrasts
+        # across all generations to construct an optimal config. This replaces
+        # the naive "apply calibration best_value" approach which ignores
+        # factor interactions (e.g. TOTAL_BATCH_SIZE_EXP direction flipping).
+        pi = self.knowledge.get_active_fraction()
+        screen_t = adaptive_screening_threshold(pi)
+        proposed = self.effect_bank.predict_optimal_config(
+            baseline=self.current_baseline,
+            locked=self.knowledge.get_locked_factors(),
+            calibrating=self.knowledge.get_calibrating_factors(),
+            screening_threshold=screen_t,
+        )
 
-        # Epoch-boundary locking: CATEGORICAL factors only
+        # 2. EPOCH-BOUNDARY PROMOTIONS (locking / calibration)
         pi = self.knowledge.get_active_fraction()
         lock_t = adaptive_locking_threshold(pi)
         self.log(f"  Promotion thresholds: π={pi:.2f} → t_lock={lock_t:.2f}")
@@ -752,18 +757,17 @@ Then on the LAST LINE, output exactly one of these three words:
         if lock_candidates:
             to_lock = {}
             for name, effect in lock_candidates[:5]:  # Max 5 locks per epoch
-                best_val = self.current_baseline.get(name)
+                best_val = proposed.get(name)
                 if best_val is not None:
                     to_lock[name] = best_val
                     self.log(f"  LOCKING (categorical): {name} = {best_val} "
                              f"(avg effect: {effect:.6f})")
             self.knowledge.lock_factors(to_lock)
 
-        # Epoch-boundary calibration: CONTINUOUS factors with proven significance
         cal_candidates = self.knowledge.suggest_calibration_candidates()
         if cal_candidates:
             for name, effect in cal_candidates[:7]:  # Max 7 calibrations per epoch
-                best_val = self.current_baseline.get(name)
+                best_val = proposed.get(name)
                 if best_val is None:
                     continue
                 f_orig = find_factor(name)
@@ -773,19 +777,21 @@ Then on the LAST LINE, output exactly one of these three words:
                     best_val, effect, f_orig.low, f_orig.high, name,
                 )
                 self.knowledge.calibrate_factor(name, best_val, cal_low, cal_high)
-                self.current_baseline[name] = best_val
+                proposed[name] = best_val
                 self.log(f"  CALIBRATING (continuous): {name} = {best_val} "
                          f"[{cal_low:.4f}, {cal_high:.4f}] "
                          f"(avg effect: {effect:.6f})")
 
-        # Graduate stale factors: tested extensively but can't pass consistency
-        # Categoricals → locked, Continuous → calibrating
+        # Graduate stale factors
         graduated = self.knowledge.graduate_stale_factors(
-            self.current_baseline, min_tests=10, min_sig=5,
+            proposed, min_tests=10, min_sig=5,
             log_fn=self.log,
         )
         if graduated:
-            self.current_baseline.update(graduated)
+            proposed.update(graduated)
+
+        # 3. SET PROPOSED BASELINE (only place baseline changes within an epoch)
+        self.current_baseline = proposed
 
         # Propose next factor set via LLM (if enabled)
         if self.llm_mode == "llm":
@@ -808,7 +814,8 @@ Then on the LAST LINE, output exactly one of these three words:
         self.save_checkpoint()
 
         cal_summary = self.knowledge.get_calibrating_factors()
-        self.log(f"\nEPOCH {self.epoch - 1} COMPLETE")
+        completed_epoch = self.epoch - 1
+        self.log(f"\nEPOCH {completed_epoch} COMPLETE")
         self.log(f"  Best val_bpb this epoch: {epoch_best['val_bpb']:.6f}")
         self.log(f"  Global best: {self.knowledge.get_best_val_bpb():.6f}")
         self.log(f"  Total experiments: {self.total_experiments}")
@@ -818,7 +825,6 @@ Then on the LAST LINE, output exactly one of these three words:
         self.log(f"  Total calibrating: {list(cal_summary.keys())}")
 
         # --- Epoch-level retrospective metrics ---
-        completed_epoch = self.epoch - 1
         epoch_metrics = {
             "epoch": completed_epoch,
             "total_locked_factors": list(self.knowledge.get_locked_factors().keys()),
@@ -855,10 +861,26 @@ Then on the LAST LINE, output exactly one of these three words:
                      f"({gt['n_significant']} sig: {gt['significant_factors']}) "
                      f"[{gt['wall_clock_s']:.0f}s]")
 
-        # POST-EPOCH VALIDATION: run the evolved baseline solo to measure true val_bpb
-        self._run_epoch_validation(completed_epoch)
+        # 4. POST-EPOCH VALIDATION: run proposed baseline solo
+        val_bpb = self._run_epoch_validation(completed_epoch)
 
-    def _run_epoch_validation(self, completed_epoch: int):
+        # 5. REGRESSION GATE: revert if validation regressed significantly
+        REGRESSION_THRESHOLD = 0.010  # ~2σ based on V1 validation noise
+        best_ever = self.knowledge.get_best_val_bpb()
+        if val_bpb is not None and val_bpb > best_ever + REGRESSION_THRESHOLD:
+            revert_config = self.knowledge.get_best_validation_config()
+            if revert_config:
+                self.current_baseline = revert_config
+                self.log(f"  ⚠️  REGRESSION DETECTED: {val_bpb:.6f} > "
+                         f"{best_ever:.6f} + {REGRESSION_THRESHOLD}")
+                self.log(f"  REVERTED baseline to best validation config")
+                self.save_checkpoint()
+
+        # Log effect bank summary and save snapshot
+        self.log(self.effect_bank.summary_log())
+        self.effect_bank.save()
+
+    def _run_epoch_validation(self, completed_epoch: int) -> float | None:
         """Run a single solo experiment with the evolved baseline config.
 
         Called after every epoch (G3 complete, before next epoch starts).
@@ -867,8 +889,12 @@ Then on the LAST LINE, output exactly one of these three words:
 
         Architecture factors (HEAD_DIM, ASPECT_RATIO) are fixed at model_dim=256
         to avoid the throughput-capacity confound discovered in PB screening.
+
+        Returns:
+            val_bpb if successful, None if failed/timeout.
         """
         self.log(f"\n--- EPOCH {completed_epoch} VALIDATION RUN ---")
+        val_bpb = None  # Will be set if validation succeeds
 
         # Build validation config from current evolved baseline
         val_config = dict(self.current_baseline)
@@ -954,6 +980,7 @@ Then on the LAST LINE, output exactly one of these three words:
 
         self.total_experiments += 1
         self.save_checkpoint()
+        return val_bpb if val_bpb != float("inf") else None
 
     def _get_latest_generation_summary(self) -> dict:
         """Retrieve the most recently recorded generation summary from knowledge."""
@@ -993,6 +1020,9 @@ Then on the LAST LINE, output exactly one of these three words:
             self.total_experiments = checkpoint.get("total_experiments", 0)
             self.log(f"Resumed from checkpoint: epoch={self.epoch}, "
                      f"experiments={self.total_experiments}")
+
+        # Bootstrap effect bank from historical data
+        self.effect_bank.bootstrap_from_effects_dir(self.arm_name)
 
 
 def setup_workspace(workspace_dir: Path, source_dir: Path):

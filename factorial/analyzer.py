@@ -365,4 +365,13 @@ def generation_summary(
         "foldovers_run": foldover_factors,
         "winner_config": {k: v for k, v in winner.items()
                           if k in {f.name for f in factors}},
+        # Raw per-run val_bpb values for EffectBank interaction analysis.
+        # Stored as list of floats (None for crashed/inf runs).
+        # Small cost (~200 bytes for PB12), enables interaction pooling
+        # without TSV parsing.
+        "responses": [
+            float(r) if np.isfinite(r) else None
+            for r in responses
+        ],
+        "n_factors": len(factors),
     }

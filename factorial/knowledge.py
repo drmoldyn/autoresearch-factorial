@@ -177,6 +177,32 @@ class KnowledgeStore:
         """Return the global best val_bpb."""
         return self.data.get("global_best_val_bpb", float("inf"))
 
+    def get_best_validation_config(self) -> dict | None:
+        """Return the config associated with the best-ever val_bpb.
+
+        Checks both validation records and the global best config,
+        returning whichever has the lowest val_bpb. Used by the
+        regression gate to revert baseline when validation regresses.
+        """
+        # Check validation records
+        validations = self.data.get("validations", [])
+        best_val_config = None
+        best_val_bpb = float("inf")
+        if validations:
+            best_rec = min(validations, key=lambda v: v.get("val_bpb", float("inf")))
+            best_val_bpb = best_rec.get("val_bpb", float("inf"))
+            best_val_config = best_rec.get("config")
+
+        # Check global best (may come from imported V1 data)
+        global_best_bpb = self.data.get("global_best_val_bpb", float("inf"))
+        global_best_config = self.data.get("global_best_config")
+
+        if global_best_bpb < best_val_bpb and global_best_config:
+            return dict(global_best_config)
+        if best_val_config:
+            return dict(best_val_config)
+        return dict(global_best_config) if global_best_config else None
+
     def get_epoch_best(self, epoch: int) -> dict:
         """Return the best config and val_bpb for a specific epoch."""
         if epoch < len(self.data["epochs"]):
